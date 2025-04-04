@@ -11,6 +11,7 @@ import (
 	"time"
 )
 
+// holds info about a scanned port
 type ScanResult struct {
 	Target string `json:"target"`
 	Port   int    `json:"port"`
@@ -18,65 +19,72 @@ type ScanResult struct {
 	Banner string `json:"banner,omitempty"`
 }
 
-// Worker function to scan ports concurrently
-func worker(wg *sync.WaitGroup, tasks chan string, results chan ScanResult, dialer net.Dialer, grabBanner bool) {
+// checks if a port is open and grabs banner if needed
+func worker(wg *sync.WaitGroup, jobs chan string, results chan ScanResult, d net.Dialer, grab bool) {
 	defer wg.Done()
-	for addr := range tasks {
-		target, portStr, _ := net.SplitHostPort(addr)
-		port, _ := strconv.Atoi(portStr)
-		conn, err := dialer.Dial("tcp", addr)
+
+	for address := range jobs {
+		host, portStr, _ := net.SplitHostPort(address)
+		portNum, _ := strconv.Atoi(portStr)
+
+		conn, err := d.Dial("tcp", address)
 		if err == nil {
 			var banner string
-			if grabBanner {
+			if grab {
 				conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 				buf := make([]byte, 1024)
 				n, _ := conn.Read(buf)
-				banner = string(buf[:n]) // Capture potential server response (if any)
+				banner = string(buf[:n])
 			}
 			conn.Close()
-			results <- ScanResult{Target: target, Port: port, Open: true, Banner: banner}
+			results <- ScanResult{Target: host, Port: portNum, Open: true, Banner: banner}
 		} else {
-			results <- ScanResult{Target: target, Port: port, Open: false}
+			results <- ScanResult{Target: host, Port: portNum, Open: false}
 		}
 	}
 }
 
 func main() {
-	var targetsStr string
-	var startPort, endPort, workers, timeout int
-	var portsList string
-	var jsonOutput, grabBanner bool
+	var targetList string
+	var startPort, endPort int
+	var numWorkers int
+	var timeoutSec int
+	var jsonOut bool
+	var portInput string
+	var grabBanner bool
 
-	// Command-line flags for user customization
-	flag.StringVar(&targetsStr, "targets", "scanme.nmap.org", "Comma-separated list of targets")
-	flag.IntVar(&startPort, "start-port", 1, "Start port")
-	flag.IntVar(&endPort, "end-port", 1024, "End port")
-	flag.IntVar(&workers, "workers", 100, "Number of concurrent workers")
-	flag.IntVar(&timeout, "timeout", 5, "Timeout in seconds per connection")
-	flag.BoolVar(&jsonOutput, "json", false, "Output results in JSON format")
-	flag.StringVar(&portsList, "ports", "", "Comma-separated list of specific ports to scan")
-	flag.BoolVar(&grabBanner, "banner", false, "Enable banner grabbing")
+	// set up flags
+	flag.StringVar(&targetList, "targets", "scanme.nmap.org", "List of targets separated by commas")
+	flag.IntVar(&startPort, "start-port", 1, "Start port number")
+	flag.IntVar(&endPort, "end-port", 1024, "End port number")
+	flag.IntVar(&numWorkers, "workers", 100, "How many goroutines to use")
+	flag.IntVar(&timeoutSec, "timeout", 5, "Timeout per connection in seconds")
+	flag.BoolVar(&jsonOut, "json", false, "Show results in JSON")
+	flag.StringVar(&portInput, "ports", "", "Comma-separated list of ports (optional)")
+	flag.BoolVar(&grabBanner, "banner", false, "Try to read banner from open port")
 	flag.Parse()
 
-	targets := strings.Split(targetsStr, ",")
-	dialer := net.Dialer{Timeout: time.Duration(timeout) * time.Second}
-	tasks := make(chan string, 100)
+	targets := strings.Split(targetList, ",")
+
+	dialer := net.Dialer{Timeout: time.Duration(timeoutSec) * time.Second}
+	jobs := make(chan string, 100)
 	results := make(chan ScanResult, 100)
 
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(&wg, tasks, results, dialer, grabBanner)
+		go worker(&wg, jobs, results, dialer, grabBanner)
 	}
 
 	var ports []int
-	if portsList != "" {
-		for _, p := range strings.Split(portsList, ",") {
-			port, err := strconv.Atoi(p)
+	if portInput != "" {
+		portParts := strings.Split(portInput, ",")
+		for _, p := range portParts {
+			pInt, err := strconv.Atoi(p)
 			if err == nil {
-				ports = append(ports, port)
+				ports = append(ports, pInt)
 			} else {
-				fmt.Printf("Invalid port: %s\n", p) // Ignore invalid port input
+				fmt.Println("Ignoring bad port:", p)
 			}
 		}
 	} else {
@@ -87,48 +95,54 @@ func main() {
 
 	startTime := time.Now()
 
-	// Start feeding the worker tasks
+	// send scan jobs to workers
 	go func() {
-		for _, target := range targets {
-			for _, port := range ports {
-				address := net.JoinHostPort(target, strconv.Itoa(port))
-				tasks <- address
-				fmt.Printf("Queueing scan for %s:%d\n", target, port) // Indicate scan progress
+		for _, tgt := range targets {
+			for _, prt := range ports {
+				addr := net.JoinHostPort(tgt, strconv.Itoa(prt))
+				jobs <- addr
+				fmt.Println("Queued:", addr)
 			}
 		}
-		close(tasks)
+		close(jobs)
 	}()
 
-	// Close results channel when all workers are done
+	// wait for everything to finish
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
 	var openPorts []ScanResult
-	for res := range results {
-		if res.Open {
-			openPorts = append(openPorts, res)
+	for r := range results {
+		if r.Open {
+			openPorts = append(openPorts, r)
 		}
 	}
+
 	duration := time.Since(startTime)
 
-	// Print results in either JSON or readable format
-	if jsonOutput {
-		jsonData, _ := json.MarshalIndent(openPorts, "", "  ")
-		fmt.Println(string(jsonData))
+	// output results
+	if jsonOut {
+		jsonRes, _ := json.MarshalIndent(openPorts, "", "  ")
+		fmt.Println(string(jsonRes))
 	} else {
-		fmt.Printf("\nScan complete. Results:\n")
-		fmt.Printf("Open Ports: %d\n", len(openPorts))
-		fmt.Printf("Total Ports Scanned: %d\n", len(targets)*len(ports))
-		fmt.Printf("Time Taken: %s\n", duration)
+		fmt.Println("Scan done!")
+		fmt.Println("Open Ports:", len(openPorts))
+		fmt.Println("Scanned:", len(targets)*len(ports))
+		fmt.Println("Took:", duration)
+
 		if len(openPorts) > 0 {
-			fmt.Println("Open ports:")
-			for _, res := range openPorts {
-				fmt.Printf("- %s:%d (Banner: %s)\n", res.Target, res.Port, res.Banner)
+			fmt.Println("Open Ports List:")
+			for _, item := range openPorts {
+				fmt.Printf(" - %s:%d", item.Target, item.Port)
+				if grabBanner && item.Banner != "" {
+					fmt.Printf(" | Banner: %s", item.Banner)
+				}
+				fmt.Println()
 			}
 		} else {
-			fmt.Println("No open ports detected.") // message if no results
+			fmt.Println("No open ports found.")
 		}
 	}
 }
